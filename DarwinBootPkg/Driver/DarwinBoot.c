@@ -183,7 +183,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, UINT64 *MemoryLimit, BOOLEAN *KeepPacked)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -194,6 +194,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  TrustCandidate;
   UINTN  AddonCandidate;
   UINTN  MemoryCandidate;
+  UINTN  LimitCandidate;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -203,6 +204,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   TrustCandidate = MAX_UINTN;
   AddonCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
+  LimitCandidate = MAX_UINTN;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
@@ -240,6 +242,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       MemoryCandidate = *Offset;
     }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-limit") == 0) {
+      if ((LimitCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
+      LimitCandidate = *Offset;
+    }
     *Offset += Length;
     if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
     *Offset = ALIGN_VALUE (*Offset, 4);
@@ -265,9 +271,14 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     *WindowSize = U64 (Data + MemoryCandidate);
     if (!DarwinWindowSizeValid (*WindowSize)) { return FALSE; }
   }
+  if (LimitCandidate != MAX_UINTN) {
+    if ((Path != 1) || (*MemoryLimit != 0)) { return FALSE; }
+    *MemoryLimit = U64 (Data + LimitCandidate);
+    if ((*MemoryLimit == 0) || (*MemoryLimit & (BLOCK_SIZE - 1))) { return FALSE; }
+  }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, MemoryLimit, KeepPacked)) { return FALSE; }
   }
   return TRUE;
 }
@@ -345,6 +356,67 @@ RunEnd (EFI_MEMORY_DESCRIPTOR *Map, UINTN Size, UINTN Stride, UINT64 Start, UINT
   } while (Extended);
   (VOID)Start;
   return End;
+}
+
+// The RAM the kernel may take beyond its window once boot services have exited: the run of physically adjacent descriptors after
+// Start that are RAM nothing uses after ExitBootServices, ending before Limit. Besides free memory and boot services and loader
+// code and data that includes the runtime services' code and data and reclaimable ACPI tables: the kernel never calls runtime
+// services or reads ACPI (edk2 keeps a runtime data page just below 4 GiB, which would otherwise split the RAM there). Reserved,
+// ACPI NVS, MMIO and unusable ranges end the run.
+STATIC
+BOOLEAN
+Reclaimable (UINT32 Type)
+{
+  return (Type == EfiConventionalMemory) || (Type == EfiBootServicesCode) || (Type == EfiBootServicesData) ||
+         (Type == EfiLoaderCode) || (Type == EfiLoaderData) || (Type == EfiRuntimeServicesCode) ||
+         (Type == EfiRuntimeServicesData) || (Type == EfiACPIReclaimMemory);
+}
+
+STATIC
+UINT64
+ReclaimableEnd (EFI_MEMORY_DESCRIPTOR *Map, UINTN Size, UINTN Stride, UINT64 Start, UINT64 Limit)
+{
+  EFI_MEMORY_DESCRIPTOR *Descriptor;
+  UINTN                 Offset;
+  UINT64                End;
+  BOOLEAN               Extended;
+
+  End = Start;
+  do {
+    Extended = FALSE;
+    for (Offset = 0; (Offset + Stride <= Size) && (End < Limit); Offset += Stride) {
+      Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
+      if (Reclaimable (Descriptor->Type) && (Descriptor->PhysicalStart == End) && (Descriptor->NumberOfPages != 0) &&
+          (Descriptor->NumberOfPages < (MAX_UINT64 - End) / EFI_PAGE_SIZE)) {
+        End += EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
+        Extended = TRUE;
+      }
+    }
+  } while (Extended && (End < Limit));
+  return MIN (End, Limit);
+}
+
+// The firmware's memory map on the serial console, adjacent descriptors of one type merged: where the window and its extension
+// can lie on a new machine.
+STATIC
+VOID
+LogMap (EFI_MEMORY_DESCRIPTOR *Map, UINTN Size, UINTN Stride)
+{
+  EFI_MEMORY_DESCRIPTOR *Descriptor;
+  UINTN                 Offset;
+  UINTN                 Next;
+  UINT64                End;
+
+  for (Offset = 0; Offset + Stride <= Size; Offset = Next) {
+    Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
+    End = Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
+    for (Next = Offset + Stride; Next + Stride <= Size; Next += Stride) {
+      EFI_MEMORY_DESCRIPTOR *Following = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Next);
+      if ((Following->Type != Descriptor->Type) || (Following->PhysicalStart != End)) { break; }
+      End += EFI_PAGES_TO_SIZE (Following->NumberOfPages);
+    }
+    DEBUG ((DEBUG_ERROR, "map %2u 0x%09lx-0x%09lx\n", Descriptor->Type, Descriptor->PhysicalStart, End));
+  }
 }
 
 // Large diagnostic text straight into the GOP framebuffer: the UEFI text console font is too small to
@@ -481,6 +553,8 @@ Boot (
   UINT64                          TreeAddress;
   UINT64                          Used;
   UINT64                          WindowSize;
+  UINT64                          MemoryLimit;
+  UINT64                          MemorySize;
   UINT64                          RamdiskAddress;
   UINTN                           RamdiskOffset;
   UINTN                           RamdiskBytes;
@@ -553,8 +627,9 @@ Boot (
   TrustCacheOffset = MAX_UINTN;
   AddonOffset = MAX_UINTN;
   WindowSize = 0;
+  MemoryLimit = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &MemoryLimit, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -655,8 +730,21 @@ Boot (
   Root->Close (Root); Root = NULL;
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
-  Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
-         Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+  //
+  // With /chosen darwinboot-memory-limit the kernel also gets the RAM after its window that the firmware gives up at
+  // ExitBootServices, up to the limit: the window only has to hold what is loaded into it, and the kernel's memory no longer
+  // stops at the first allocation the firmware made above it.
+  //
+  MemorySize = WindowSize;
+  if (MemoryLimit > Address + WindowSize) {
+    MemorySize = (ReclaimableEnd (Map, MapSize, Stride, Address + WindowSize, MemoryLimit) & ~(UINT64)(BLOCK_SIZE - 1)) - Address;
+    if (MemorySize < WindowSize) { MemorySize = WindowSize; }
+    Args->MemorySize = MemorySize;
+    Args->MemorySizeActual = MemorySize;
+    LogMap (Map, MapSize, Stride);
+  }
+  Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx memory=0x%lx\n",
+         Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize, MemorySize);
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
   Print (L"DARWINBOOT: command line: %a\n", CommandLine);
@@ -670,7 +758,7 @@ Boot (
   DEBUG ((DEBUG_ERROR, "\fDARWINBOOT: hand-off to the kernel\n\n"));
   DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
   DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
-  DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
+  DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes  memory 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize, MemorySize));
   DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
   DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
@@ -691,7 +779,7 @@ Boot (
     }
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
+      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, MemorySize, Video[0], Video[2] * Video[4]);
       CpuDeadLoop ();
     }
     if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }
