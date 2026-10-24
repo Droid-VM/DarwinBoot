@@ -48,7 +48,7 @@ STATIC UINT64 U64 (CONST VOID *P) { return ReadUnaligned64 ((CONST UINT64 *)P); 
 
 STATIC
 EFI_STATUS
-ReadBootVideo (UINT64 Video[6])
+ReadBootVideo (UINT64 Video[6], UINT64 VideoMemory[2], BOOLEAN *VideoAllocated)
 {
   EFI_GRAPHICS_OUTPUT_PROTOCOL           *Gop;
   EFI_STATUS                            Status;
@@ -60,7 +60,39 @@ ReadBootVideo (UINT64 Video[6])
   }
   if (Status == EFI_NOT_FOUND) { return EFI_SUCCESS; }
   if (EFI_ERROR (Status)) { return Status; }
-  return DarwinBootVideoFromGop (Gop, Video);
+  Status = DarwinBootVideoFromGop (Gop, Video);
+  if ((Status != EFI_UNSUPPORTED) || (VideoMemory[0] == 0)) { return Status; }
+  Status = DarwinBootVideoFromBltGop (Gop, VideoMemory[0], VideoMemory[1], Video);
+  if (EFI_ERROR (Status)) { return Status; }
+  EFI_PHYSICAL_ADDRESS Base = VideoMemory[0];
+  Status = gBS->AllocatePages (AllocateAddress, EfiReservedMemoryType, EFI_SIZE_TO_PAGES (VideoMemory[1]), &Base);
+  if (EFI_ERROR (Status)) {
+    // Firmware runtime/boot allocations may already occupy the preferred top-of-RAM range.
+    // Obtain an aligned free buffer below that ceiling, then lower XNU's reclaim limit to it.
+    EFI_PHYSICAL_ADDRESS Raw = VideoMemory[0] + VideoMemory[1] - 1;
+    UINTN Bytes = (UINTN)VideoMemory[1] + BLOCK_SIZE;
+    Status = gBS->AllocatePages (AllocateMaxAddress, EfiReservedMemoryType, EFI_SIZE_TO_PAGES (Bytes), &Raw);
+    if (EFI_ERROR (Status)) {
+      Print (L"DARWINBOOT: cannot reserve BLT video RAM: %r\n", Status);
+      ZeroMem (Video, 6 * sizeof (*Video)); return Status;
+    }
+    Base = ALIGN_VALUE (Raw, BLOCK_SIZE);
+    if (Base != Raw) { gBS->FreePages (Raw, EFI_SIZE_TO_PAGES (Base - Raw)); }
+    UINTN Tail = Bytes - (UINTN)(Base - Raw) - (UINTN)VideoMemory[1];
+    if (Tail != 0) { gBS->FreePages (Base + VideoMemory[1], EFI_SIZE_TO_PAGES (Tail)); }
+    VideoMemory[0] = Base;
+    Video[0] = Base;
+  }
+  *VideoAllocated = TRUE;
+  ZeroMem ((VOID *)(UINTN)Base, (UINTN)VideoMemory[1]);
+  // Preserve the last firmware image if the GOP supports readback. XNU later owns the RAM image.
+  if (Gop->Blt != NULL) {
+    Status = Gop->Blt (Gop, (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)(UINTN)Base, EfiBltVideoToBltBuffer,
+                      0, 0, 0, 0, (UINTN)Video[3], (UINTN)Video[4], (UINTN)Video[2]);
+    if (EFI_ERROR (Status)) { ZeroMem ((VOID *)(UINTN)Base, (UINTN)VideoMemory[1]); }
+  }
+  DEBUG ((DEBUG_ERROR, "DARWINBOOT: BLT-only GOP handoff RAM 0x%lx+0x%lx\n", Base, VideoMemory[1]));
+  return EFI_SUCCESS;
 }
 
 STATIC
@@ -183,7 +215,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, UINT64 *MemoryLimit, BOOLEAN *KeepPacked)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, UINT64 *MemoryLimit, UINT64 VideoMemory[2], BOOLEAN *KeepPacked)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -195,6 +227,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  AddonCandidate;
   UINTN  MemoryCandidate;
   UINTN  LimitCandidate;
+  UINTN  VideoCandidate;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -205,6 +238,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   AddonCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
   LimitCandidate = MAX_UINTN;
+  VideoCandidate = MAX_UINTN;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
@@ -246,6 +280,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((LimitCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       LimitCandidate = *Offset;
     }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-video-memory") == 0) {
+      if ((VideoCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      VideoCandidate = *Offset;
+    }
     *Offset += Length;
     if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
     *Offset = ALIGN_VALUE (*Offset, 4);
@@ -276,9 +314,17 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     *MemoryLimit = U64 (Data + LimitCandidate);
     if ((*MemoryLimit == 0) || (*MemoryLimit & (BLOCK_SIZE - 1))) { return FALSE; }
   }
+  if (VideoCandidate != MAX_UINTN) {
+    if ((Path != 1) || (VideoMemory[0] != 0)) { return FALSE; }
+    VideoMemory[0] = U64 (Data + VideoCandidate);
+    VideoMemory[1] = U64 (Data + VideoCandidate + 8);
+    if ((VideoMemory[0] == 0) || (VideoMemory[0] & (BLOCK_SIZE - 1)) ||
+        (VideoMemory[1] < BLOCK_SIZE) || (VideoMemory[1] > SIZE_64MB) ||
+        (VideoMemory[1] & (BLOCK_SIZE - 1)) || (VideoMemory[0] > MAX_UINT64 - VideoMemory[1])) { return FALSE; }
+  }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, MemoryLimit, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, MemoryLimit, VideoMemory, KeepPacked)) { return FALSE; }
   }
   return TRUE;
 }
@@ -554,6 +600,8 @@ Boot (
   UINT64                          Used;
   UINT64                          WindowSize;
   UINT64                          MemoryLimit;
+  UINT64                          VideoMemory[2];
+  BOOLEAN                         VideoAllocated;
   UINT64                          MemorySize;
   UINT64                          RamdiskAddress;
   UINTN                           RamdiskOffset;
@@ -606,6 +654,8 @@ Boot (
   TreePath = NULL;
   Map = NULL;
   Address = 0;
+  VideoAllocated = FALSE;
+  ZeroMem (VideoMemory, sizeof (VideoMemory));
   Capacity = 0;
   Status = gBS->HandleProtocol (Request->Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
   if (EFI_ERROR (Status)) { return Status; }
@@ -629,7 +679,7 @@ Boot (
   WindowSize = 0;
   MemoryLimit = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &MemoryLimit, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &MemoryLimit, VideoMemory, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -672,8 +722,11 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
-  Status = ReadBootVideo (Video);
+  // The kernel's contiguous RAM must end before the reserved boot video image.
+  if (VideoMemory[0] && (!MemoryLimit || MemoryLimit > VideoMemory[0])) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  Status = ReadBootVideo (Video, VideoMemory, &VideoAllocated);
   if (EFI_ERROR (Status)) { goto Fail; }
+  if (VideoAllocated) { MemoryLimit = MIN (MemoryLimit, VideoMemory[0]); }
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
   if (EFI_ERROR (Status)) { goto Fail; }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
@@ -795,6 +848,7 @@ Fail:
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
+  if (VideoAllocated) { gBS->FreePages (VideoMemory[0], EFI_SIZE_TO_PAGES (VideoMemory[1])); }
   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
   return Status;
 }

@@ -49,6 +49,29 @@ ValidateVideo (VOID)
   }
   if (Index != 8) { return EFI_DEVICE_ERROR; }
   Print (L"DARWINBOOT-VIDEO-VALIDATION: 8 malformed/unsupported GOP field sets refused PASS\n");
+  ZeroMem (&Info, sizeof (Info));
+  ZeroMem (&Mode, sizeof (Mode));
+  Info.HorizontalResolution = 1366;
+  Info.VerticalResolution = 1024;
+  Info.PixelFormat = PixelBltOnly;
+  Mode.Info = &Info;
+  Mode.SizeOfInfo = sizeof (Info);
+  Gop.Mode = &Mode;
+  Status = DarwinBootVideoFromBltGop (&Gop, 0x180000000ULL, SIZE_8MB, Video);
+  if (EFI_ERROR (Status) || Video[0] != 0x180000000ULL || Video[2] != 5504 ||
+      Video[3] != 1366 || Video[4] != 1024 || Video[5] != 32) { return EFI_DEVICE_ERROR; }
+  if (DarwinBootVideoFromBltGop (&Gop, 0x180000001ULL, SIZE_8MB, Video) != EFI_COMPROMISED_DATA ||
+      DarwinBootVideoFromBltGop (&Gop, 0, SIZE_8MB, Video) != EFI_COMPROMISED_DATA ||
+      DarwinBootVideoFromBltGop (&Gop, 0x180000000ULL, SIZE_4MB, Video) != EFI_BUFFER_TOO_SMALL ||
+      DarwinBootVideoFromBltGop (&Gop, MAX_UINT64 - EFI_PAGE_SIZE + 1, SIZE_8MB, Video) != EFI_COMPROMISED_DATA) {
+    return EFI_DEVICE_ERROR;
+  }
+  // BLT-only modes intentionally have no GOP framebuffer and no PixelsPerScanLine.
+  Info.HorizontalResolution = 0;
+  if (DarwinBootVideoFromBltGop (&Gop, 0x180000000ULL, SIZE_8MB, Video) != EFI_COMPROMISED_DATA) {
+    return EFI_DEVICE_ERROR;
+  }
+  Print (L"DARWINBOOT-VIDEO-VALIDATION: BLT-only reserved RAM, pitch and malformed ranges PASS\n");
   return EFI_SUCCESS;
 }
 
