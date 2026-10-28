@@ -16,6 +16,10 @@
 //                            then net, virtio-gpu (with drm-host-pool), virtio-snd and virtio-media-N (with media-host-pool),
 //                            the pools being the FDT's droidvm,pool nodes; and battery for a google,goldfish-battery node.
 //                            The nodes are the ones make-droidvm-adt.py writes, appended after /arm-io's own children.
+//   DARWIN_BOOT_FDT_CPUS     /cpus from the FDT's CPUs, by MPIDR (at most eight, ArmCpu's limit): the tree's own cpu0 becomes
+//                            the first, the rest are copies of it in the waiting state. /arm-io/intc reg from the FDT's GICv3
+//                            windows (crosvm lays the redistributors out by the vCPU count) and /psci method from its conduit,
+//                            both in place.
 #include <Uefi.h>
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
@@ -31,6 +35,8 @@
 #define BUILDER_SIZE     SIZE_16KB
 #define VIRTIO_MAGIC     0x74726976   // "virt"
 #define VIRTIO_BLK_F_RO  BIT5
+#define MAX_CPUS         8         // ArmCpu starts at most eight cores
+#define REDIST_STRIDE    0x20000   // GICv3 without VLPI: RD_base + SGI_base frames
 
 //
 // EmbeddedPkg's FDT_CLIENT_PROTOCOL (Include/Protocol/FdtClient.h), member for member; Mu's basecore has no EmbeddedPkg.
@@ -246,6 +252,29 @@ BeginNode (ADT_BUILDER *B, CONST CHAR8 *Name)
   B->Nodes++;
 }
 
+// Puts the nodes B holds after the children of the node at Parent, the tree being replaced by a larger copy.
+STATIC
+EFI_STATUS
+AdtAppend (VOID **Tree, UINTN *TreeSize, UINTN Parent, ADT_BUILDER *B)
+{
+  UINT8 *New;
+  UINTN End;
+
+  if (B->Overflow) { return EFI_BUFFER_TOO_SMALL; }
+  End = Parent;
+  if (!AdtSkip (*Tree, *TreeSize, &End, 1)) { return EFI_COMPROMISED_DATA; }
+  New = AllocatePool (*TreeSize + B->Used);
+  if (New == NULL) { return EFI_OUT_OF_RESOURCES; }
+  CopyMem (New, *Tree, End);
+  CopyMem (New + End, B->Data, B->Used);
+  CopyMem (New + End + B->Used, (UINT8 *)*Tree + End, *TreeSize - End);
+  WriteUnaligned32 ((UINT32 *)(New + Parent + 4), U32 (New + Parent + 4) + B->Nodes);
+  FreePool (*Tree);
+  *Tree = New;
+  *TreeSize += B->Used;
+  return EFI_SUCCESS;
+}
+
 // A device node under /arm-io: its window relative to the arm-io base, and the pool it maps, if any.
 STATIC
 VOID
@@ -426,7 +455,6 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   WINDOW       Windows[MAX_WINDOWS];
   ADT_BUILDER  B;
   UINT8        *Data;
-  UINT8        *New;
   UINTN        Count;
   UINTN        Index;
   UINTN        ArmIo;
@@ -443,6 +471,7 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   UINT64       Battery[2];
   INT32        Node;
   CHAR8        Name[32];
+  EFI_STATUS   Status;
 
   Data = *Tree;
   if (!AdtChild (Data, *TreeSize, 0, "arm-io", &ArmIo)) { return EFI_COMPROMISED_DATA; }
@@ -452,8 +481,6 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
       return EFI_COMPROMISED_DATA;
     }
   }
-  End = ArmIo;
-  if (!AdtSkip (Data, *TreeSize, &End, 1)) { return EFI_COMPROMISED_DATA; }
   Count = FindWindows (Fdt, Windows);
   FindPool (Fdt, "drm2kgsl_host", DrmPool);
   FindPool (Fdt, "media_host", MediaPool);
@@ -511,20 +538,160 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   if ((Battery[1] != 0) && (Battery[0] >= ARMIO_BASE) && (Battery[0] <= ARMIO_END - Battery[1])) {
     AddWindow (&B, "battery", "google,goldfish-battery", Battery[0], Battery[1], FALSE, NULL, NULL);
   }
-  if (B.Overflow) { FreePool (B.Data); return EFI_BUFFER_TOO_SMALL; }
-  New = AllocatePool (*TreeSize + B.Used);
-  if (New == NULL) { FreePool (B.Data); return EFI_OUT_OF_RESOURCES; }
-  CopyMem (New, Data, End);
-  CopyMem (New + End, B.Data, B.Used);
-  CopyMem (New + End + B.Used, Data + End, *TreeSize - End);
-  WriteUnaligned32 ((UINT32 *)(New + ArmIo + 4), U32 (New + ArmIo + 4) + B.Nodes);
+  Status = AdtAppend (Tree, TreeSize, ArmIo, &B);
+  FreePool (B.Data);
+  if (EFI_ERROR (Status)) { return Status; }
   Print (L"DARWINBOOT: FDT devices: %u disk(s)%a, %u input, %a%a%a%u media, pools drm 0x%lx+0x%lx media 0x%lx+0x%lx%a\n",
          (UINT32)Disks, Store ? " + data store" : "", (UINT32)Inputs, Net ? "net, " : "", Gpu ? "gpu, " : "",
          Sound ? "snd, " : "", (UINT32)Media, DrmPool[0], DrmPool[1], MediaPool[0], MediaPool[1], Battery[1] ? ", battery" : "");
+  return EFI_SUCCESS;
+}
+
+// The FDT's CPUs (device_type "cpu"; crosvm's are "arm,armv8") by MPIDR, at most MAX_CPUS, the lowest first: the boot CPU, as
+// crosvm starts vCPU 0 (MPIDR 0). 0 when two share an MPIDR.
+STATIC
+UINTN
+FindCpus (DB_FDT_CLIENT *Fdt, UINT32 *Regs)
+{
+  INT32      Node;
+  CONST VOID *Value;
+  UINT32     Length;
+  UINT64     Mpidr;
+  UINTN      Count;
+  UINTN      Index;
+  UINT32     All[64];
+  EFI_STATUS Status;
+
+  Count = 0;
+  for (Status = Fdt->FindCompatibleNode (Fdt, "arm,armv8", &Node); !EFI_ERROR (Status) && (Count < ARRAY_SIZE (All));
+       Status = Fdt->FindNextCompatibleNode (Fdt, "arm,armv8", Node, &Node)) {
+    if (EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "device_type", &Value, &Length)) || (Length != 4) ||
+        (CompareMem (Value, "cpu", 4) != 0)) { continue; }
+    if (EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "reg", &Value, &Length))) { continue; }
+    if (Length == 4) {
+      Mpidr = SwapBytes32 (U32 (Value));
+    } else if (Length == 8) {
+      Mpidr = Be64 (Value);
+    } else {
+      continue;
+    }
+    if (Mpidr > MAX_UINT32) { continue; }   // Aff3: no 32-bit ADT reg for it
+    for (Index = Count; (Index > 0) && (All[Index - 1] > (UINT32)Mpidr); Index--) {
+      All[Index] = All[Index - 1];
+    }
+    All[Index] = (UINT32)Mpidr;
+    Count++;
+  }
+  for (Index = 1; Index < Count; Index++) {
+    if (All[Index] == All[Index - 1]) { return 0; }
+  }
+  if (Count > MAX_CPUS) { Count = MAX_CPUS; }
+  CopyMem (Regs, All, Count * sizeof (UINT32));
+  return Count;
+}
+
+STATIC
+EFI_STATUS
+FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
+{
+  STATIC CONST CHAR8  *Conduits[] = { "arm,psci-1.0", "arm,psci-0.2", "arm,psci" };
+  UINT32       Regs[MAX_CPUS];
+  UINT64       Gic[4];
+  ADT_BUILDER  B;
+  UINT8        *Data;
+  UINTN        Count;
+  UINTN        Index;
+  UINTN        Cpus;
+  UINTN        Cpu0;
+  UINTN        ArmIo;
+  UINTN        Intc;
+  UINTN        Psci;
+  UINTN        Compatible;
+  UINTN        Timebase;
+  UINT32       CompatibleLength;
+  UINT32       TimebaseLength;
+  UINT32       Children;
+  UINT32       Length;
+  INT32        Node;
+  CONST VOID   *Value;
+  CHAR8        Name[32];
+  EFI_STATUS   Status;
+
+  Data = *Tree;
+  Cpu0 = 0;
+  if (AdtChild (Data, *TreeSize, 0, "cpus", &Cpus)) {
+    Cpu0 = Cpus;
+    if (!AdtProperties (Data, *TreeSize, &Cpu0, &Children)) { return EFI_COMPROMISED_DATA; }
+  } else {
+    Children = 0;
+  }
+  if ((Children != 1) || !AdtIsNamed (Data, *TreeSize, Cpu0, "cpu0")) {
+    Print (L"DARWINBOOT: the tree must have /cpus with cpu0 alone to take the CPUs from the FDT\n");
+    return EFI_COMPROMISED_DATA;
+  }
+  if (!AdtProperty (Data, *TreeSize, Cpu0, "compatible", &Compatible, &CompatibleLength) ||
+      !AdtProperty (Data, *TreeSize, Cpu0, "timebase-frequency", &Timebase, &TimebaseLength) ||
+      !AdtChild (Data, *TreeSize, 0, "arm-io", &ArmIo) || !AdtChild (Data, *TreeSize, ArmIo, "intc", &Intc)) {
+    return EFI_COMPROMISED_DATA;
+  }
+  Count = FindCpus (Fdt, Regs);
+  if (Count == 0) {
+    Print (L"DARWINBOOT: the firmware's FDT has no CPUs to trust\n");
+    return EFI_NOT_FOUND;
+  }
+  if (EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "arm,gic-v3", &Node)) ||
+      EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "reg", &Value, &Length)) || (Length < 32)) {
+    Print (L"DARWINBOOT: the firmware's FDT has no GICv3 distributor and redistributor windows\n");
+    return EFI_NOT_FOUND;
+  }
+  for (Index = 0; Index < 4; Index++) {
+    Gic[Index] = Be64 ((CONST UINT8 *)Value + 8 * Index);
+  }
+  for (Index = 0; Index < 4; Index += 2) {
+    if ((Gic[Index] < ARMIO_BASE) || (Gic[Index + 1] == 0) || (Gic[Index] > ARMIO_END - Gic[Index + 1])) {
+      return EFI_COMPROMISED_DATA;
+    }
+  }
+  if (Gic[3] / REDIST_STRIDE < Count) {
+    Print (L"DARWINBOOT: FDT redistributor window 0x%lx holds fewer than %u frames\n", Gic[3], (UINT32)Count);
+    return EFI_COMPROMISED_DATA;
+  }
+  Gic[0] -= ARMIO_BASE;
+  Gic[2] -= ARMIO_BASE;
+  if (!AdtSet (Data, *TreeSize, Intc, "reg", Gic, sizeof (Gic)) || !AdtSet (Data, *TreeSize, Cpu0, "reg", &Regs[0], 4)) {
+    return EFI_COMPROMISED_DATA;
+  }
+  // The conduit, when both the tree and the FDT name one ("hvc" and "smc" are the same length).
+  for (Index = 0; Index < ARRAY_SIZE (Conduits); Index++) {
+    if (!EFI_ERROR (Fdt->FindCompatibleNode (Fdt, Conduits[Index], &Node)) &&
+        !EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "method", &Value, &Length)) && (Length == 4) &&
+        AdtChild (Data, *TreeSize, 0, "psci", &Psci)) {
+      AdtSet (Data, *TreeSize, Psci, "method", Value, 4);
+      break;
+    }
+  }
+  if ((Count > 1) && !AdtChild (Data, *TreeSize, 0, "psci", &Psci)) {
+    Print (L"DARWINBOOT: %u CPUs and no /psci to start them with\n", (UINT32)Count);
+    return EFI_COMPROMISED_DATA;
+  }
+  ZeroMem (&B, sizeof (B));
+  B.Data = AllocatePool (BUILDER_SIZE);
+  if (B.Data == NULL) { return EFI_OUT_OF_RESOURCES; }
+  // As make-droidvm-adt.py writes the CPUs after the first.
+  for (Index = 1; Index < Count; Index++) {
+    AsciiSPrint (Name, sizeof (Name), "cpu%u", (UINT32)Index);
+    BeginNode (&B, Name);
+    AddString (&B, "state", "waiting");
+    AddProperty (&B, "reg", &Regs[Index], 4);
+    AddString (&B, "device_type", "cpu");
+    AddProperty (&B, "compatible", Data + Compatible, CompatibleLength);
+    AddProperty (&B, "timebase-frequency", Data + Timebase, TimebaseLength);
+  }
+  Status = AdtAppend (Tree, TreeSize, Cpus, &B);
   FreePool (B.Data);
-  FreePool (*Tree);
-  *Tree = New;
-  *TreeSize += B.Used;
+  if (EFI_ERROR (Status)) { return Status; }
+  Print (L"DARWINBOOT: FDT CPUs: %u, MPIDR 0x%x..0x%x, gic 0x%lx redist 0x%lx+0x%lx\n", (UINT32)Count, Regs[0],
+         Regs[Count - 1], Gic[0] + ARMIO_BASE, Gic[2] + ARMIO_BASE, Gic[3]);
   return EFI_SUCCESS;
 }
 
@@ -545,7 +712,7 @@ DarwinBootFdtAdt (
       !AdtProperty (*Tree, *TreeSize, Chosen, "darwinboot-fdt", &At, &Length)) { return EFI_SUCCESS; }
   if (Length != 4) { return EFI_COMPROMISED_DATA; }
   Ask = U32 ((UINT8 *)*Tree + At);
-  if (Ask & ~(UINT32)(DARWIN_BOOT_FDT_MEMORY | DARWIN_BOOT_FDT_DEVICES)) { return EFI_COMPROMISED_DATA; }
+  if (Ask & ~(UINT32)(DARWIN_BOOT_FDT_MEMORY | DARWIN_BOOT_FDT_DEVICES | DARWIN_BOOT_FDT_CPUS)) { return EFI_COMPROMISED_DATA; }
   Status = gBS->LocateProtocol (&mFdtClientGuid, NULL, (VOID **)&Fdt);
   if (EFI_ERROR (Status)) {
     Print (L"DARWINBOOT: the tree asks for the FDT and the firmware has no FDT client: %r\n", Status);
@@ -553,6 +720,10 @@ DarwinBootFdtAdt (
   }
   if (Ask & DARWIN_BOOT_FDT_MEMORY) {
     Status = FillMemory (Fdt, *Tree, *TreeSize, Chosen);
+    if (EFI_ERROR (Status)) { return Status; }
+  }
+  if (Ask & DARWIN_BOOT_FDT_CPUS) {
+    Status = FillCpus (Fdt, Tree, TreeSize);
     if (EFI_ERROR (Status)) { return Status; }
   }
   if (Ask & DARWIN_BOOT_FDT_DEVICES) {

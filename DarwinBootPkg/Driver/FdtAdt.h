@@ -10,6 +10,7 @@
 //
 #define DARWIN_BOOT_FDT_MEMORY   BIT0   // /chosen dram-base, dram-size and what follows from the RAM's end
 #define DARWIN_BOOT_FDT_DEVICES  BIT1   // the /arm-io nodes of the VM's virtio-mmio devices, its pools and its battery
+#define DARWIN_BOOT_FDT_CPUS     BIT2   // /cpus, the GICv3 windows in /arm-io/intc and the /psci conduit
 
 /**
   Completes the Apple device tree in Tree from the firmware's flattened device tree, when /chosen asks for it.
@@ -19,7 +20,7 @@
 
   @retval EFI_SUCCESS  The tree is complete (or did not ask for anything).
   @retval other        The tree asked for the FDT and it could not be completed: the firmware has no FDT, or the FDT lacks
-                       the guest's RAM.
+                       the guest's RAM, its CPUs or its GICv3.
 **/
 EFI_STATUS
 DarwinBootFdtAdt (
