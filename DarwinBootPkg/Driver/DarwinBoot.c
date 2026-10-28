@@ -111,7 +111,7 @@ Done:
 
 STATIC
 EFI_STATUS
-ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
+ParseKernelHeader (CONST UINT8 *Data, UINTN Size, UINTN Header, KERNEL *Kernel)
 {
   UINTN    Offset;
   UINTN    End;
@@ -124,15 +124,19 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
   BOOLEAN  HasEntry;
   BOOLEAN  Executable;
 
-  if ((Size < 32) || (U32 (Data) != 0xfeedfacf) || (U32 (Data + 4) != 0x100000c) ||
-      (U32 (Data + 8) != 0) || (U32 (Data + 12) != 2)) {
+  if ((Header > Size) || (Size - Header < 32) ||
+      (U32 (Data + Header) != 0xfeedfacf) || (U32 (Data + Header + 4) != 0x100000c) ||
+      (((U32 (Data + Header + 8) & 0x00ffffff) != 0) &&
+       ((U32 (Data + Header + 8) & 0x00ffffff) != 2)) ||
+      ((U32 (Data + Header + 12) != 2) &&
+       ((Header != 0) || (U32 (Data + Header + 12) != 12)))) {
     return EFI_UNSUPPORTED;
   }
-  if (U32 (Data + 20) > Size - 32) { return EFI_LOAD_ERROR; }
+  if (U32 (Data + Header + 20) > Size - Header - 32) { return EFI_LOAD_ERROR; }
   ZeroMem (Kernel, sizeof (*Kernel));
-  Count = U32 (Data + 16);
-  End = 32 + U32 (Data + 20);
-  Offset = 32;
+  Count = U32 (Data + Header + 16);
+  End = Header + 32 + U32 (Data + Header + 20);
+  Offset = Header + 32;
   HasEntry = FALSE;
   for (Index = 0; Index < Count; Index++) {
     if (End - Offset < 8) { return EFI_LOAD_ERROR; }
@@ -181,9 +185,89 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
   return EFI_SUCCESS;
 }
 
+// Fileset segment offsets are absolute in the collection. XNU rebases and
+// signs its own fixup chains after entry; firmware only copies root mappings.
+STATIC
+EFI_STATUS
+ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
+{
+  EFI_STATUS Status;
+  KERNEL     Member;
+  UINTN      Offset;
+  UINTN      End;
+  UINTN      Header;
+  UINTN      Name;
+  UINTN      Index;
+  UINTN      Other;
+  UINT32     Length;
+  BOOLEAN    Found;
+  BOOLEAN    Covered;
+  SEGMENT    *Child;
+  SEGMENT    *Parent;
+
+  Status = ParseKernelHeader (Data, Size, 0, Kernel);
+  if (EFI_ERROR (Status) || (U32 (Data + 12) != 12)) { return Status; }
+  Offset = 32;
+  End = 32 + U32 (Data + 20);
+  Found = FALSE;
+  while (Offset < End) {
+    Length = U32 (Data + Offset + 4);
+    if (U32 (Data + Offset) == 0x80000035) {
+      if (Length < 40) { return EFI_LOAD_ERROR; }
+      Name = U32 (Data + Offset + 24);
+      if ((Name < 32) || (Name >= Length)) { return EFI_LOAD_ERROR; }
+      for (Index = Name; (Index < Length) && (Data[Offset + Index] != 0); Index++) {}
+      if (Index == Length) { return EFI_LOAD_ERROR; }
+      Header = U64 (Data + Offset + 16);
+      if ((Header > Size) || (Size - Header < 32) || (Header & 7)) { return EFI_LOAD_ERROR; }
+      // Every indexed header must actually be loaded at its advertised VA.
+      Covered = FALSE;
+      for (Other = 0; Other < Kernel->Count; Other++) {
+        Parent = &Kernel->Segments[Other];
+        if ((Header >= Parent->FileOffset) &&
+            (Header - Parent->FileOffset <= Parent->FileSize) &&
+            (32 <= Parent->FileSize - (Header - Parent->FileOffset)) &&
+            (U64 (Data + Offset + 8) == Parent->Address + Header - Parent->FileOffset)) {
+          Covered = TRUE;
+        }
+      }
+      if (!Covered) { return EFI_LOAD_ERROR; }
+      if ((Index - Name == sizeof ("com.apple.kernel") - 1) &&
+          (CompareMem (Data + Offset + Name, "com.apple.kernel", sizeof ("com.apple.kernel")) == 0)) {
+        if (Found || (U32 (Data + Header + 12) != 2) ||
+            (U32 (Data + Header + 8) != U32 (Data + 8)) ||
+            ((U32 (Data + Header + 24) & 0x80000000) == 0)) { return EFI_LOAD_ERROR; }
+        Found = TRUE;
+        Status = ParseKernelHeader (Data, Size, Header, &Member);
+        if (EFI_ERROR (Status) || (Member.Entry != Kernel->Entry)) { return EFI_LOAD_ERROR; }
+        for (Index = 0; Index < Member.Count; Index++) {
+          Child = &Member.Segments[Index];
+          Covered = FALSE;
+          for (Other = 0; Other < Kernel->Count; Other++) {
+            Parent = &Kernel->Segments[Other];
+            if ((Child->Address >= Parent->Address) &&
+                (Child->Address - Parent->Address <= Parent->Size) &&
+                (Child->Size <= Parent->Size - (Child->Address - Parent->Address)) &&
+                ((Child->Protection & ~Parent->Protection) == 0) &&
+                ((Child->FileSize == 0) ||
+                 ((Child->Address - Parent->Address <= Parent->FileSize) &&
+                  (Child->FileSize <= Parent->FileSize - (Child->Address - Parent->Address)) &&
+                  (Child->FileOffset == Parent->FileOffset + Child->Address - Parent->Address)))) {
+              Covered = TRUE;
+            }
+          }
+          if (!Covered) { return EFI_LOAD_ERROR; }
+        }
+      }
+    }
+    Offset += Length;
+  }
+  return Found ? EFI_SUCCESS : EFI_LOAD_ERROR;
+}
+
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -193,6 +277,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  Candidate;
   UINTN  TrustCandidate;
   UINTN  AddonCandidate;
+  UINTN  PolicyCandidate;
   UINTN  MemoryCandidate;
   CONST UINT8 *Name;
   UINTN  NameLength;
@@ -202,6 +287,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   Candidate = MAX_UINTN;
   TrustCandidate = MAX_UINTN;
   AddonCandidate = MAX_UINTN;
+  PolicyCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
@@ -236,6 +322,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((AddonCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
       AddonCandidate = *Offset;
     }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "RootPolicies") == 0) {
+      if ((PolicyCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+      PolicyCandidate = *Offset;
+    }
     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-size") == 0) {
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       MemoryCandidate = *Offset;
@@ -260,6 +350,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     if (*AddonOffset != MAX_UINTN) { return FALSE; }
     *AddonOffset = AddonCandidate;
   }
+  if (PolicyCandidate != MAX_UINTN) {
+    if ((Path != 2) || (*PolicyOffset != MAX_UINTN)) { return FALSE; }
+    *PolicyOffset = PolicyCandidate;
+  }
   if (MemoryCandidate != MAX_UINTN) {
     if ((Path != 1) || (*WindowSize != 0)) { return FALSE; }
     *WindowSize = U64 (Data + MemoryCandidate);
@@ -267,7 +361,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked)) { return FALSE; }
   }
   return TRUE;
 }
@@ -491,6 +585,10 @@ Boot (
   UINT64                          TrustCacheAddress;
   UINTN                           AddonOffset;
   UINT64                          AddonAddress;
+  VOID                            *Policies;
+  UINTN                           PolicySize;
+  UINTN                           PolicyOffset;
+  UINT64                          PolicyAddress;
   DARWIN_BOOT_ARGS                *Args;
   EFI_MEMORY_DESCRIPTOR           *Map;
   UINTN                           Capacity;
@@ -529,6 +627,8 @@ Boot (
   TrustCaches = NULL;
   Addon = NULL;
   AddonSize = 0;
+  Policies = NULL;
+  PolicySize = 0;
   TreePath = NULL;
   Map = NULL;
   Address = 0;
@@ -552,9 +652,10 @@ Boot (
   RamdiskOffset = MAX_UINTN;
   TrustCacheOffset = MAX_UINTN;
   AddonOffset = MAX_UINTN;
+  PolicyOffset = MAX_UINTN;
   WindowSize = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -597,6 +698,25 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
+  // Root hash tables live outside the kernel's coalesced constant segments.
+  // The kernel authenticates each envelope against its compiled owner anchor.
+  CopyMem (TreePath, Request->KernelPath, Length);
+  StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".vroot");
+  Status = ReadFile (Root, TreePath, SIZE_128MB, &Policies, &PolicySize);
+  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
+  if (Policies != NULL) {
+    if ((PolicyOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + PolicyOffset) != 0) ||
+        (U64 ((UINT8 *)Tree + PolicyOffset + 8) != 0) || (PolicySize < 32) ||
+        (CompareMem (Policies, "VROOTB01", 8) != 0) || (U64 ((UINT8 *)Policies + 8) != 1) ||
+        (U64 ((UINT8 *)Policies + 16) == 0) || (U64 ((UINT8 *)Policies + 16) > 16) ||
+        (U64 ((UINT8 *)Policies + 24) != PolicySize)) {
+      Status = EFI_COMPROMISED_DATA;
+      goto Fail;
+    }
+  } else if (PolicyOffset != MAX_UINTN) {
+    Status = EFI_COMPROMISED_DATA;
+    goto Fail;
+  }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
@@ -607,7 +727,8 @@ Boot (
   RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
   TrustCacheAddress = RamdiskAddress + RamdiskBytes;
   AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
-  Used = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB) - Address;
+  PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
+  Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
@@ -648,6 +769,12 @@ Boot (
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset), AddonAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
     FreePool (Addon); Addon = NULL;
+  }
+  if (Policies != NULL) {
+    CopyMem ((VOID *)(UINTN)PolicyAddress, Policies, PolicySize);
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset), PolicyAddress);
+    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset + 8), PolicySize);
+    FreePool (Policies); Policies = NULL;
   }
   FreePool (Image); Image = NULL;
   FreePool (Tree); Tree = NULL;
@@ -704,6 +831,7 @@ Fail:
   if (Tree != NULL) { FreePool (Tree); }
   if (TrustCaches != NULL) { FreePool (TrustCaches); }
   if (Addon != NULL) { FreePool (Addon); }
+  if (Policies != NULL) { FreePool (Policies); }
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
