@@ -14,6 +14,7 @@
 #include <Protocol/SimpleFileSystem.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
+#include "FdtAdt.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
 
@@ -672,6 +673,11 @@ Boot (
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
   Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
   if (EFI_ERROR (Status)) { goto Fail; }
+  //
+  // What the tree leaves to the VM (/chosen darwinboot-fdt): its RAM and its devices, from the firmware's FDT.
+  //
+  Status = DarwinBootFdtAdt (&Tree, &TreeSize);
+  if (EFI_ERROR (Status)) { Print (L"DARWINBOOT: completing the device tree from the FDT failed: %r\n", Status); goto Fail; }
   Offset = 0;
   RamdiskOffset = MAX_UINTN;
   TrustCacheOffset = MAX_UINTN;

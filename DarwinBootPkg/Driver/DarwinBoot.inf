@@ -9,6 +9,8 @@
 
 [Sources]
   DarwinBoot.c
+  FdtAdt.c
+  FdtAdt.h
   PackedRamdisk.h
   BootArgs.h
   BootVideo.h
