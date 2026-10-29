@@ -102,7 +102,7 @@ def main():
     (output / 'ramdisk.bin').write_bytes(b'DRAMDISK' + bytes(4088) + b'\xa5')
     variants = {'kernel': bytes(image), 'bad-adt': bytes(image), 'missing-adt': bytes(image),
                 **{name: bytes(image) for name in extra_trees}}
-    for name, offset, fmt, value in [('bad-subtype', 8, '<I', 2),
+    for name, offset, fmt, value in [('bad-subtype', 8, '<I', 3),
                                      ('bad-command', 20, '<I', len(image)),
                                      ('bad-overlap', 32 + 72 + 24, '<Q', BASE + 0x1000),
                                      ('bad-entry', 32 + 144 + 272, '<Q', BASE + 0x3000)]:
