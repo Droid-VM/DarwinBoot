@@ -14,7 +14,9 @@
 //   DARWIN_BOOT_FDT_DEVICES  an /arm-io node per virtio-mmio window, by the device ID the window reports: a read-only disk
 //                            is virtio-mmio-N (NativeVirtioBlock), the first writable one data-store, input devices input-N,
 //                            then net, virtio-gpu (with drm-host-pool), virtio-snd and virtio-media-N (with media-host-pool),
-//                            the pools being the FDT's droidvm,pool nodes; and battery for a google,goldfish-battery node.
+//                            the pools being the FDT's droidvm,pool nodes; battery for a google,goldfish-battery node; and
+//                            cpufreq for a qemu,virtual-cpufreq node (one 4 KiB window per vCPU, where the guest writes
+//                            the performance it wants; crosvm's --virt-cpufreq-upstream, as Linux's virtual-cpufreq driver).
 //                            The nodes are the ones make-droidvm-adt.py writes, appended after /arm-io's own children.
 //   DARWIN_BOOT_FDT_CPUS     /cpus from the FDT's CPUs, by MPIDR (at most eight, ArmCpu's limit): the tree's own cpu0 becomes
 //                            the first, the rest are copies of it in the waiting state. /arm-io/intc reg from the FDT's GICv3
@@ -451,7 +453,7 @@ STATIC
 EFI_STATUS
 FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
 {
-  STATIC CONST CHAR8  *Taken[] = { "data-store", "net", "virtio-gpu", "virtio-snd", "battery", "input-0", "virtio-mmio-0", "virtio-media-0" };
+  STATIC CONST CHAR8  *Taken[] = { "data-store", "net", "virtio-gpu", "virtio-snd", "battery", "cpufreq", "input-0", "virtio-mmio-0", "virtio-media-0" };
   WINDOW       Windows[MAX_WINDOWS];
   ADT_BUILDER  B;
   UINT8        *Data;
@@ -469,6 +471,7 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   UINT64       DrmPool[2];
   UINT64       MediaPool[2];
   UINT64       Battery[2];
+  UINT64       Cpufreq[2];
   INT32        Node;
   CHAR8        Name[32];
   EFI_STATUS   Status;
@@ -487,6 +490,10 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   Battery[1] = 0;
   if (!EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "google,goldfish-battery", &Node)) && !FdtReg (Fdt, Node, &Battery[0], &Battery[1])) {
     Battery[1] = 0;
+  }
+  Cpufreq[1] = 0;
+  if (!EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "qemu,virtual-cpufreq", &Node)) && !FdtReg (Fdt, Node, &Cpufreq[0], &Cpufreq[1])) {
+    Cpufreq[1] = 0;
   }
   ZeroMem (&B, sizeof (B));
   B.Data = AllocatePool (BUILDER_SIZE);
@@ -538,12 +545,16 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   if ((Battery[1] != 0) && (Battery[0] >= ARMIO_BASE) && (Battery[0] <= ARMIO_END - Battery[1])) {
     AddWindow (&B, "battery", "google,goldfish-battery", Battery[0], Battery[1], FALSE, NULL, NULL);
   }
+  if ((Cpufreq[1] != 0) && (Cpufreq[0] >= ARMIO_BASE) && (Cpufreq[0] <= ARMIO_END - Cpufreq[1])) {
+    AddWindow (&B, "cpufreq", "qemu,virtual-cpufreq", Cpufreq[0], Cpufreq[1], FALSE, NULL, NULL);
+  }
   Status = AdtAppend (Tree, TreeSize, ArmIo, &B);
   FreePool (B.Data);
   if (EFI_ERROR (Status)) { return Status; }
-  Print (L"DARWINBOOT: FDT devices: %u disk(s)%a, %u input, %a%a%a%u media, pools drm 0x%lx+0x%lx media 0x%lx+0x%lx%a\n",
+  Print (L"DARWINBOOT: FDT devices: %u disk(s)%a, %u input, %a%a%a%u media, pools drm 0x%lx+0x%lx media 0x%lx+0x%lx%a%a\n",
          (UINT32)Disks, Store ? " + data store" : "", (UINT32)Inputs, Net ? "net, " : "", Gpu ? "gpu, " : "",
-         Sound ? "snd, " : "", (UINT32)Media, DrmPool[0], DrmPool[1], MediaPool[0], MediaPool[1], Battery[1] ? ", battery" : "");
+         Sound ? "snd, " : "", (UINT32)Media, DrmPool[0], DrmPool[1], MediaPool[0], MediaPool[1], Battery[1] ? ", battery" : "",
+         Cpufreq[1] ? ", cpufreq" : "");
   return EFI_SUCCESS;
 }
 
