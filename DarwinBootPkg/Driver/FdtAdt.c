@@ -21,7 +21,10 @@
 //   DARWIN_BOOT_FDT_CPUS     /cpus from the FDT's CPUs, by MPIDR (at most eight, ArmCpu's limit): the tree's own cpu0 becomes
 //                            the first, the rest are copies of it in the waiting state. /arm-io/intc reg from the FDT's GICv3
 //                            windows (crosvm lays the redistributors out by the vCPU count) and /psci method from its conduit,
-//                            both in place.
+//                            both in place. Each CPU's cluster-type from its capacity-dmips-mhz (crosvm --cpu-capacity, the host
+//                            core's capacity under the vCPU): "P" for the highest, "E" below it, "P" for all when they are equal
+//                            or one has none -- as make-droidvm-adt.py writes cpu0's, which must carry one (an AMP kernel panics
+//                            on a CPU of no cluster type).
 #include <Uefi.h>
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
@@ -559,10 +562,10 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
 }
 
 // The FDT's CPUs (device_type "cpu"; crosvm's are "arm,armv8") by MPIDR, at most MAX_CPUS, the lowest first: the boot CPU, as
-// crosvm starts vCPU 0 (MPIDR 0). 0 when two share an MPIDR.
+// crosvm starts vCPU 0 (MPIDR 0), each with its capacity-dmips-mhz (0 without one). 0 when two share an MPIDR.
 STATIC
 UINTN
-FindCpus (DB_FDT_CLIENT *Fdt, UINT32 *Regs)
+FindCpus (DB_FDT_CLIENT *Fdt, UINT32 *Regs, UINT32 *Capacities)
 {
   INT32      Node;
   CONST VOID *Value;
@@ -571,6 +574,8 @@ FindCpus (DB_FDT_CLIENT *Fdt, UINT32 *Regs)
   UINTN      Count;
   UINTN      Index;
   UINT32     All[64];
+  UINT32     Caps[64];
+  UINT32     Capacity;
   EFI_STATUS Status;
 
   Count = 0;
@@ -587,10 +592,16 @@ FindCpus (DB_FDT_CLIENT *Fdt, UINT32 *Regs)
       continue;
     }
     if (Mpidr > MAX_UINT32) { continue; }   // Aff3: no 32-bit ADT reg for it
+    Capacity = 0;
+    if (!EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "capacity-dmips-mhz", &Value, &Length)) && (Length == 4)) {
+      Capacity = SwapBytes32 (U32 (Value));
+    }
     for (Index = Count; (Index > 0) && (All[Index - 1] > (UINT32)Mpidr); Index--) {
       All[Index] = All[Index - 1];
+      Caps[Index] = Caps[Index - 1];
     }
     All[Index] = (UINT32)Mpidr;
+    Caps[Index] = Capacity;
     Count++;
   }
   for (Index = 1; Index < Count; Index++) {
@@ -598,6 +609,7 @@ FindCpus (DB_FDT_CLIENT *Fdt, UINT32 *Regs)
   }
   if (Count > MAX_CPUS) { Count = MAX_CPUS; }
   CopyMem (Regs, All, Count * sizeof (UINT32));
+  CopyMem (Capacities, Caps, Count * sizeof (UINT32));
   return Count;
 }
 
@@ -607,6 +619,10 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
 {
   STATIC CONST CHAR8  *Conduits[] = { "arm,psci-1.0", "arm,psci-0.2", "arm,psci" };
   UINT32       Regs[MAX_CPUS];
+  UINT32       Capacities[MAX_CPUS];
+  CHAR8        Types[MAX_CPUS][2];
+  UINT32       Highest;
+  BOOLEAN      Differ;
   UINT64       Gic[4];
   ADT_BUILDER  B;
   UINT8        *Data;
@@ -645,10 +661,21 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
       !AdtChild (Data, *TreeSize, 0, "arm-io", &ArmIo) || !AdtChild (Data, *TreeSize, ArmIo, "intc", &Intc)) {
     return EFI_COMPROMISED_DATA;
   }
-  Count = FindCpus (Fdt, Regs);
+  Count = FindCpus (Fdt, Regs, Capacities);
   if (Count == 0) {
     Print (L"DARWINBOOT: the firmware's FDT has no CPUs to trust\n");
     return EFI_NOT_FOUND;
+  }
+  Highest = 0;
+  Differ = FALSE;
+  for (Index = 0; Index < Count; Index++) {
+    if (Capacities[Index] == 0) { Highest = 0; Differ = FALSE; break; }
+    if ((Index > 0) && (Capacities[Index] != Capacities[0])) { Differ = TRUE; }
+    if (Capacities[Index] > Highest) { Highest = Capacities[Index]; }
+  }
+  for (Index = 0; Index < Count; Index++) {
+    Types[Index][0] = (Differ && (Capacities[Index] < Highest)) ? 'E' : 'P';
+    Types[Index][1] = '\0';
   }
   if (EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "arm,gic-v3", &Node)) ||
       EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "reg", &Value, &Length)) || (Length < 32)) {
@@ -671,6 +698,9 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   Gic[2] -= ARMIO_BASE;
   if (!AdtSet (Data, *TreeSize, Intc, "reg", Gic, sizeof (Gic)) || !AdtSet (Data, *TreeSize, Cpu0, "reg", &Regs[0], 4)) {
     return EFI_COMPROMISED_DATA;
+  }
+  if (!AdtSet (Data, *TreeSize, Cpu0, "cluster-type", Types[0], 2)) {
+    Print (L"DARWINBOOT: cpu0 has no cluster-type to set (a tree from before make-droidvm-adt.py wrote one)\n");
   }
   // The conduit, when both the tree and the FDT name one ("hvc" and "smc" are the same length).
   for (Index = 0; Index < ARRAY_SIZE (Conduits); Index++) {
@@ -697,11 +727,16 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
     AddString (&B, "device_type", "cpu");
     AddProperty (&B, "compatible", Data + Compatible, CompatibleLength);
     AddProperty (&B, "timebase-frequency", Data + Timebase, TimebaseLength);
+    AddProperty (&B, "cluster-type", Types[Index], 2);
   }
   Status = AdtAppend (Tree, TreeSize, Cpus, &B);
   FreePool (B.Data);
   if (EFI_ERROR (Status)) { return Status; }
-  Print (L"DARWINBOOT: FDT CPUs: %u, MPIDR 0x%x..0x%x, gic 0x%lx redist 0x%lx+0x%lx\n", (UINT32)Count, Regs[0],
+  for (Index = 0; Index < Count; Index++) {
+    Name[Index] = Types[Index][0];
+  }
+  Name[Count] = '\0';
+  Print (L"DARWINBOOT: FDT CPUs: %u (%a), MPIDR 0x%x..0x%x, gic 0x%lx redist 0x%lx+0x%lx\n", (UINT32)Count, Name, Regs[0],
          Regs[Count - 1], Gic[0] + ARMIO_BASE, Gic[2] + ARMIO_BASE, Gic[3]);
   return EFI_SUCCESS;
 }
