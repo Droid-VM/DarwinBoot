@@ -23,6 +23,16 @@
 //                            a driver that waits for the device instead of polling it (ArmCpu's armcpu_spi_attach). Not
 //                            "interrupts": IOKit maps that one into interrupt specifiers through an interrupt-parent the
 //                            GIC's node does not offer, and no driver here takes the device's interrupts through IOKit.
+//                            A virtio-console window is virtio-console-N. The serial ports: uart0 for the SBSA UART (an
+//                            arm,pl011 node, crosvm's --serial hardware=sbsa) and com1..com4 for the 16550 COM ports (ns16550a
+//                            nodes, in the FDT's order, which is crosvm's num), each with an AAPL,phandle; a COM port lies
+//                            below the arm-io base, so its reg offset wraps (IOKit gives such a node no device memory, the
+//                            kernel's serial driver adds it to the base). /defaults droidvm,serial-device names the kernel's
+//                            serial console: the UART the FDT's /chosen stdout-path names (crosvm writes it for an SBSA UART that
+//                            is the console), else the SBSA UART, else none -- crosvm always has its four COM ports, unconnected
+//                            ones writing nowhere, so a COM port is the console only by the boot argument serial-device-name.
+//                            Not the standard serial-device: xnu-12377 panics on one naming a UART it has no driver for, which
+//                            a kernel without the board's UART patch (droidvm-serial-uarts.patch) does not have.
 //   DARWIN_BOOT_FDT_CPUS     /cpus from the FDT's CPUs, by MPIDR (at most eight, ArmCpu's limit): the tree's own cpu0 becomes
 //                            the first, the rest are copies of it in the waiting state. /arm-io/intc reg from the FDT's GICv3
 //                            windows (crosvm lays the redistributors out by the vCPU count) and /psci method from its conduit,
@@ -54,6 +64,8 @@
 #define VIRTIO_BLK_F_RO  BIT5
 #define MAX_CPUS         8         // ArmCpu starts at most eight cores
 #define REDIST_STRIDE    0x20000   // GICv3 without VLPI: RD_base + SGI_base frames
+#define MAX_COMS         4         // crosvm's 16550 COM ports
+#define UART_PHANDLE     0x44560000 // "DV": the AAPL,phandle of uart0, com1..com4 the next ones (the tree's nodes carry none)
 
 //
 // EmbeddedPkg's FDT_CLIENT_PROTOCOL (Include/Protocol/FdtClient.h), member for member; Mu's basecore has no EmbeddedPkg.
@@ -293,6 +305,33 @@ AdtAppend (VOID **Tree, UINTN *TreeSize, UINTN Parent, ADT_BUILDER *B)
   return EFI_SUCCESS;
 }
 
+// Adds property Name to the node at Node, after its other properties, the tree being replaced by a larger copy.
+STATIC
+EFI_STATUS
+AdtInsert (VOID **Tree, UINTN *TreeSize, UINTN Node, CONST CHAR8 *Name, CONST VOID *Value, UINT32 Length)
+{
+  UINT8  *New;
+  UINTN  End;
+  UINTN  Bytes;
+  UINT32 Children;
+
+  End = Node;
+  if ((AsciiStrLen (Name) >= 32) || !AdtProperties (*Tree, *TreeSize, &End, &Children)) { return EFI_COMPROMISED_DATA; }
+  Bytes = 36 + ALIGN_VALUE (Length, 4);
+  New = AllocateZeroPool (*TreeSize + Bytes);
+  if (New == NULL) { return EFI_OUT_OF_RESOURCES; }
+  CopyMem (New, *Tree, End);
+  AsciiStrCpyS ((CHAR8 *)(New + End), 32, Name);
+  WriteUnaligned32 ((UINT32 *)(New + End + 32), Length);
+  CopyMem (New + End + 36, Value, Length);
+  CopyMem (New + End + Bytes, (UINT8 *)*Tree + End, *TreeSize - End);
+  WriteUnaligned32 ((UINT32 *)(New + Node), U32 (New + Node) + 1);
+  FreePool (*Tree);
+  *Tree = New;
+  *TreeSize += Bytes;
+  return EFI_SUCCESS;
+}
+
 // A device node under /arm-io: its window relative to the arm-io base, and the pool it maps, if any.
 STATIC
 VOID
@@ -340,6 +379,34 @@ FdtInterrupt (DB_FDT_CLIENT *Fdt, INT32 Node)
   if ((Type == 0) && (Number < 988)) { return 32 + Number; }
   if ((Type == 1) && (Number < 16)) { return 16 + Number; }
   return 0;
+}
+
+// The unit address of the node /chosen stdout-path names ("/pl011@6000", "/U6_16550A@3f8:115200n8"); 0 when it names none.
+STATIC
+UINT64
+FdtStdoutAddress (DB_FDT_CLIENT *Fdt)
+{
+  INT32       Chosen;
+  CONST CHAR8 *Path;
+  UINT32      Length;
+  UINT32      Index;
+  UINT64      Address;
+  UINT32      Digits;
+  CHAR8       C;
+
+  if (EFI_ERROR (Fdt->GetOrInsertChosenNode (Fdt, &Chosen)) ||
+      EFI_ERROR (Fdt->GetNodeProperty (Fdt, Chosen, "stdout-path", (CONST VOID **)&Path, &Length))) { return 0; }
+  for (Index = 0; (Index < Length) && (Path[Index] != '@') && (Path[Index] != '\0'); Index++) {}
+  Address = 0;
+  Digits = 0;
+  for (Index++; (Index < Length) && (Digits < 16); Index++, Digits++) {
+    C = Path[Index];
+    if ((C >= '0') && (C <= '9')) { Address = (Address << 4) | (UINT64)(C - '0'); }
+    else if ((C >= 'a') && (C <= 'f')) { Address = (Address << 4) | (UINT64)(C - 'a' + 10); }
+    else if ((C >= 'A') && (C <= 'F')) { Address = (Address << 4) | (UINT64)(C - 'A' + 10); }
+    else { break; }
+  }
+  return Address;
 }
 
 STATIC
@@ -501,7 +568,8 @@ STATIC
 EFI_STATUS
 FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
 {
-  STATIC CONST CHAR8  *Taken[] = { "data-store", "net", "virtio-gpu", "virtio-snd", "battery", "cpufreq", "input-0", "virtio-mmio-0", "virtio-media-0" };
+  STATIC CONST CHAR8  *Taken[] = { "data-store", "net", "virtio-gpu", "virtio-snd", "battery", "cpufreq", "input-0", "virtio-mmio-0", "virtio-media-0",
+                                   "virtio-console-0", "uart0", "com1" };
   WINDOW       Windows[MAX_WINDOWS];
   ADT_BUILDER  B;
   UINT8        *Data;
@@ -520,6 +588,14 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   UINT64       MediaPool[2];
   UINT64       Battery[2];
   UINT64       Cpufreq[2];
+  UINT64       Pl011[2];
+  UINT64       Coms[MAX_COMS][2];
+  UINTN        ComCount;
+  UINTN        Consoles;
+  UINT64       Stdout;
+  UINT32       Phandle;
+  UINT32       Console;
+  UINTN        Defaults;
   INT32        Node;
   CHAR8        Name[32];
   EFI_STATUS   Status;
@@ -543,6 +619,20 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   if (!EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "qemu,virtual-cpufreq", &Node)) && !FdtReg (Fdt, Node, &Cpufreq[0], &Cpufreq[1])) {
     Cpufreq[1] = 0;
   }
+  Pl011[1] = 0;
+  if (!EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "arm,pl011", &Node)) && !FdtReg (Fdt, Node, &Pl011[0], &Pl011[1])) {
+    Pl011[1] = 0;
+  }
+  if ((Pl011[1] == 0) || (Pl011[0] < ARMIO_BASE) || (Pl011[0] > ARMIO_END - Pl011[1])) { Pl011[1] = 0; }
+  ComCount = 0;
+  for (Status = Fdt->FindCompatibleNode (Fdt, "ns16550a", &Node); !EFI_ERROR (Status) && (ComCount < MAX_COMS);
+       Status = Fdt->FindNextCompatibleNode (Fdt, "ns16550a", Node, &Node)) {
+    if (FdtReg (Fdt, Node, &Coms[ComCount][0], &Coms[ComCount][1]) && (Coms[ComCount][1] != 0) &&
+        (Coms[ComCount][1] <= SIZE_4KB) && (Coms[ComCount][0] <= ARMIO_END - Coms[ComCount][1])) {
+      ComCount++;
+    }
+  }
+  Stdout = FdtStdoutAddress (Fdt);
   ZeroMem (&B, sizeof (B));
   B.Data = AllocatePool (BUILDER_SIZE);
   if (B.Data == NULL) { return EFI_OUT_OF_RESOURCES; }
@@ -590,19 +680,57 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
     AsciiSPrint (Name, sizeof (Name), "virtio-media-%u", (UINT32)Media++);
     AddVirtio (&B, Name, "droidvm,virtio-media", &Windows[Index], "media-host-pool", MediaPool);
   }
+  Consoles = 0;
+  for (Index = 0; Index < Count; Index++) {
+    if (Windows[Index].Device != 3) { continue; }
+    AsciiSPrint (Name, sizeof (Name), "virtio-console-%u", (UINT32)Consoles++);
+    AddVirtio (&B, Name, "droidvm,virtio-console", &Windows[Index], NULL, NULL);
+  }
   if ((Battery[1] != 0) && (Battery[0] >= ARMIO_BASE) && (Battery[0] <= ARMIO_END - Battery[1])) {
     AddWindow (&B, "battery", "google,goldfish-battery", Battery[0], Battery[1], FALSE, NULL, NULL);
   }
   if ((Cpufreq[1] != 0) && (Cpufreq[0] >= ARMIO_BASE) && (Cpufreq[0] <= ARMIO_END - Cpufreq[1])) {
     AddWindow (&B, "cpufreq", "qemu,virtual-cpufreq", Cpufreq[0], Cpufreq[1], FALSE, NULL, NULL);
   }
+  // The serial ports, and which one is the console: the one stdout-path names, else the SBSA UART (see the top).
+  Console = 0;
+  if (Pl011[1] != 0) {
+    AddWindow (&B, "uart0", "arm,pl011", Pl011[0], Pl011[1], FALSE, NULL, NULL);
+    Phandle = UART_PHANDLE;
+    AddProperty (&B, "AAPL,phandle", &Phandle, sizeof (Phandle));
+    Console = Phandle;
+  }
+  for (Index = 0; Index < ComCount; Index++) {
+    AsciiSPrint (Name, sizeof (Name), "com%u", (UINT32)Index + 1);
+    AddWindow (&B, Name, "ns16550a", Coms[Index][0], Coms[Index][1], FALSE, NULL, NULL);
+    Phandle = UART_PHANDLE + 1 + (UINT32)Index;
+    AddProperty (&B, "AAPL,phandle", &Phandle, sizeof (Phandle));
+    if ((Stdout != 0) && (Stdout == Coms[Index][0])) { Console = Phandle; }
+  }
+  if ((Pl011[1] != 0) && (Stdout != 0) && (Stdout == Pl011[0])) { Console = UART_PHANDLE; }
   Status = AdtAppend (Tree, TreeSize, ArmIo, &B);
   FreePool (B.Data);
   if (EFI_ERROR (Status)) { return Status; }
-  Print (L"DARWINBOOT: FDT devices: %u disk(s)%a, %u input, %a%a%a%u media, pools drm 0x%lx+0x%lx media 0x%lx+0x%lx%a%a\n",
+  if ((Console != 0) && AdtChild (*Tree, *TreeSize, 0, "defaults", &Defaults)) {
+    if (AdtProperty (*Tree, *TreeSize, Defaults, "droidvm,serial-device", &End, &Phandle)) {
+      Console = 0;   // the tree names its own
+    } else {
+      Status = AdtInsert (Tree, TreeSize, Defaults, "droidvm,serial-device", &Console, sizeof (Console));
+      if (EFI_ERROR (Status)) { return Status; }
+    }
+  }
+  Print (L"DARWINBOOT: FDT devices: %u disk(s)%a, %u input, %a%a%a%u media, %u console(s), pools drm 0x%lx+0x%lx media 0x%lx+0x%lx%a%a\n",
          (UINT32)Disks, Store ? " + data store" : "", (UINT32)Inputs, Net ? "net, " : "", Gpu ? "gpu, " : "",
-         Sound ? "snd, " : "", (UINT32)Media, DrmPool[0], DrmPool[1], MediaPool[0], MediaPool[1], Battery[1] ? ", battery" : "",
-         Cpufreq[1] ? ", cpufreq" : "");
+         Sound ? "snd, " : "", (UINT32)Media, (UINT32)Consoles, DrmPool[0], DrmPool[1], MediaPool[0], MediaPool[1],
+         Battery[1] ? ", battery" : "", Cpufreq[1] ? ", cpufreq" : "");
+  if (Console == 0) {
+    Print (L"DARWINBOOT: FDT serial: %a%u COM port(s), no console\n", (Pl011[1] != 0) ? "SBSA UART, " : "", (UINT32)ComCount);
+  } else if (Console == UART_PHANDLE) {
+    Print (L"DARWINBOOT: FDT serial: SBSA UART, %u COM port(s), console uart0\n", (UINT32)ComCount);
+  } else {
+    Print (L"DARWINBOOT: FDT serial: %a%u COM port(s), console com%u\n", (Pl011[1] != 0) ? "SBSA UART, " : "", (UINT32)ComCount,
+           Console - UART_PHANDLE);
+  }
   return EFI_SUCCESS;
 }
 
