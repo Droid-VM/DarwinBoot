@@ -18,13 +18,25 @@
 //                            cpufreq for a qemu,virtual-cpufreq node (one 4 KiB window per vCPU, where the guest writes
 //                            the performance it wants; crosvm's --virt-cpufreq-upstream, as Linux's virtual-cpufreq driver).
 //                            The nodes are the ones make-droidvm-adt.py writes, appended after /arm-io's own children.
+//                            Each virtio window's node carries the window's interrupt as "droidvm,intid", one GIC INTID (an
+//                            FDT SPI n is INTID 32 + n; crosvm's are level-high, as the virtio-mmio transport's line is), for
+//                            a driver that waits for the device instead of polling it (ArmCpu's armcpu_spi_attach). Not
+//                            "interrupts": IOKit maps that one into interrupt specifiers through an interrupt-parent the
+//                            GIC's node does not offer, and no driver here takes the device's interrupts through IOKit.
 //   DARWIN_BOOT_FDT_CPUS     /cpus from the FDT's CPUs, by MPIDR (at most eight, ArmCpu's limit): the tree's own cpu0 becomes
 //                            the first, the rest are copies of it in the waiting state. /arm-io/intc reg from the FDT's GICv3
 //                            windows (crosvm lays the redistributors out by the vCPU count) and /psci method from its conduit,
 //                            both in place. Each CPU's cluster-type from its capacity-dmips-mhz (crosvm --cpu-capacity, the host
-//                            core's capacity under the vCPU): "P" for the highest, "E" below it, "P" for all when they are equal
-//                            or one has none -- as make-droidvm-adt.py writes cpu0's, which must carry one (an AMP kernel panics
-//                            on a CPU of no cluster type).
+//                            core's capacity under the vCPU): "P" for the highest capacities, a whole capacity at a time, until
+//                            they are more than half the CPUs, "E" for the rest; "P" for all when they are equal or one has none
+//                            -- as make-droidvm-adt.py writes cpu0's, which must carry one (an AMP kernel panics on a CPU of no
+//                            cluster type). Only the highest was "P" before: an 8 Gen 3 VM had one performance core (its X4)
+//                            and five A720s at 85-90% of it as efficiency cores, so the UI's threads crowded onto the one vCPU
+//                            (which the phone capped at 41% of its clock at times, below the A720s) while six sat mostly idle.
+//                            Every A720 "P" went the other way: the default and background work iPadOS keeps on efficiency
+//                            cores (the render server's Metal encoding among it) crowded onto the one vCPU left, on a little
+//                            core. Now an 8 Gen 3 on all its cores has its X4 and five A720s "P" and its A520s "E", on seven
+//                            (one A520 left out) the X4 and three A720s "P"; an 8 Elite or 8 Elite Gen 5 has every core "P".
 #include <Uefi.h>
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
@@ -72,6 +84,7 @@ STATIC EFI_GUID  mFdtClientGuid = { 0xE11FACA0, 0x4710, 0x4C8E, { 0xA7, 0xA2, 0x
 STATIC UINT32 U32 (CONST VOID *P) { return ReadUnaligned32 ((CONST UINT32 *)P); }
 STATIC UINT64 U64 (CONST VOID *P) { return ReadUnaligned64 ((CONST UINT64 *)P); }
 STATIC UINT64 Be64 (CONST VOID *P) { return SwapBytes64 (ReadUnaligned64 ((CONST UINT64 *)P)); }
+STATIC UINT32 Be32 (CONST VOID *P) { return SwapBytes32 (ReadUnaligned32 ((CONST UINT32 *)P)); }
 
 //
 // The Apple device tree: a node is a UINT32 property count, a UINT32 child count, its properties (a NUL-terminated name in
@@ -293,6 +306,7 @@ AddWindow (ADT_BUILDER *B, CONST CHAR8 *Name, CONST CHAR8 *Compatible, UINT64 Ba
   if ((PoolName != NULL) && (Pool[1] != 0)) { AddPair (B, PoolName, Pool[0], Pool[1]); }
 }
 
+
 //
 // The FDT, through FDT_CLIENT_PROTOCOL. crosvm's root and /reserved-memory have two address and two size cells.
 //
@@ -307,6 +321,25 @@ FdtReg (DB_FDT_CLIENT *Fdt, INT32 Node, UINT64 *Base, UINT64 *Size)
   *Base = Be64 (Reg);
   *Size = Be64 ((CONST UINT8 *)Reg + 8);
   return TRUE;
+}
+
+// A node's first interrupt as a GIC INTID, from the GIC binding's three cells (type, number, flags): an SPI n is 32 + n, a
+// PPI n 16 + n. 0 when there is none or it is not the GIC's.
+STATIC
+UINT32
+FdtInterrupt (DB_FDT_CLIENT *Fdt, INT32 Node)
+{
+  CONST VOID *Cells;
+  UINT32     Length;
+  UINT32     Type;
+  UINT32     Number;
+
+  if (EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "interrupts", &Cells, &Length)) || (Length < 12)) { return 0; }
+  Type = Be32 (Cells);
+  Number = Be32 ((CONST UINT8 *)Cells + 4);
+  if ((Type == 0) && (Number < 988)) { return 32 + Number; }
+  if ((Type == 1) && (Number < 16)) { return 16 + Number; }
+  return 0;
 }
 
 STATIC
@@ -384,8 +417,19 @@ typedef struct {
   UINT64  Base;
   UINT64  Size;
   UINT32  Device;
+  UINT32  Intid;      // the GIC INTID of the window's interrupt; 0 when the FDT gives none
   BOOLEAN ReadOnly;
 } WINDOW;
+
+// A virtio window's node: AddWindow, and the window's interrupt when the FDT gave one.
+STATIC
+VOID
+AddVirtio (ADT_BUILDER *B, CONST CHAR8 *Name, CONST CHAR8 *Compatible, CONST WINDOW *Window, CONST CHAR8 *PoolName,
+           CONST UINT64 *Pool)
+{
+  AddWindow (B, Name, Compatible, Window->Base, Window->Size, TRUE, PoolName, Pool);
+  if (Window->Intid != 0) { AddProperty (B, "droidvm,intid", &Window->Intid, sizeof (Window->Intid)); }
+}
 
 STATIC
 UINT32
@@ -412,6 +456,7 @@ FindWindows (DB_FDT_CLIENT *Fdt, WINDOW *Windows)
     ZeroMem (&Window, sizeof (Window));
     if (!FdtReg (Fdt, Node, &Window.Base, &Window.Size) || (Window.Size < 0x100) || (Window.Base < ARMIO_BASE) ||
         (Window.Base > ARMIO_END - Window.Size)) { continue; }
+    Window.Intid = FdtInterrupt (Fdt, Node);
     if ((Mmio32 (Window.Base) == VIRTIO_MAGIC) && (Mmio32 (Window.Base + 4) == 2)) {
       Window.Device = Mmio32 (Window.Base + 8);
       if (Window.Device == 2) {
@@ -506,36 +551,36 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   for (Index = 0; Index < Count; Index++) {
     if ((Windows[Index].Device != 2) || !Windows[Index].ReadOnly) { continue; }
     AsciiSPrint (Name, sizeof (Name), "virtio-mmio-%u", (UINT32)Disks++);
-    AddWindow (&B, Name, "virtio,mmio", Windows[Index].Base, Windows[Index].Size, TRUE, NULL, NULL);
+    AddVirtio (&B, Name, "virtio,mmio", &Windows[Index], NULL, NULL);
   }
   Store = FALSE;
   for (Index = 0; (Index < Count) && !Store; Index++) {
     if ((Windows[Index].Device != 2) || Windows[Index].ReadOnly) { continue; }
-    AddWindow (&B, "data-store", "droidvm,data-store", Windows[Index].Base, Windows[Index].Size, TRUE, NULL, NULL);
+    AddVirtio (&B, "data-store", "droidvm,data-store", &Windows[Index], NULL, NULL);
     Store = TRUE;
   }
   Inputs = 0;
   for (Index = 0; Index < Count; Index++) {
     if (Windows[Index].Device != 18) { continue; }
     AsciiSPrint (Name, sizeof (Name), "input-%u", (UINT32)Inputs++);
-    AddWindow (&B, Name, "droidvm,virtio-input", Windows[Index].Base, Windows[Index].Size, TRUE, NULL, NULL);
+    AddVirtio (&B, Name, "droidvm,virtio-input", &Windows[Index], NULL, NULL);
   }
   Net = Gpu = Sound = FALSE;
   for (Index = 0; Index < Count; Index++) {
     if ((Windows[Index].Device == 1) && !Net) {
-      AddWindow (&B, "net", "droidvm,net", Windows[Index].Base, Windows[Index].Size, TRUE, NULL, NULL);
+      AddVirtio (&B, "net", "droidvm,net", &Windows[Index], NULL, NULL);
       Net = TRUE;
     }
   }
   for (Index = 0; Index < Count; Index++) {
     if ((Windows[Index].Device == 16) && !Gpu) {
-      AddWindow (&B, "virtio-gpu", "droidvm,virtio-gpu", Windows[Index].Base, Windows[Index].Size, TRUE, "drm-host-pool", DrmPool);
+      AddVirtio (&B, "virtio-gpu", "droidvm,virtio-gpu", &Windows[Index], "drm-host-pool", DrmPool);
       Gpu = TRUE;
     }
   }
   for (Index = 0; Index < Count; Index++) {
     if ((Windows[Index].Device == 25) && !Sound) {
-      AddWindow (&B, "virtio-snd", "droidvm,virtio-snd", Windows[Index].Base, Windows[Index].Size, TRUE, NULL, NULL);
+      AddVirtio (&B, "virtio-snd", "droidvm,virtio-snd", &Windows[Index], NULL, NULL);
       Sound = TRUE;
     }
   }
@@ -543,7 +588,7 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   for (Index = 0; Index < Count; Index++) {
     if (Windows[Index].Device != 48) { continue; }
     AsciiSPrint (Name, sizeof (Name), "virtio-media-%u", (UINT32)Media++);
-    AddWindow (&B, Name, "droidvm,virtio-media", Windows[Index].Base, Windows[Index].Size, TRUE, "media-host-pool", MediaPool);
+    AddVirtio (&B, Name, "droidvm,virtio-media", &Windows[Index], "media-host-pool", MediaPool);
   }
   if ((Battery[1] != 0) && (Battery[0] >= ARMIO_BASE) && (Battery[0] <= ARMIO_END - Battery[1])) {
     AddWindow (&B, "battery", "google,goldfish-battery", Battery[0], Battery[1], FALSE, NULL, NULL);
@@ -622,6 +667,9 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   UINT32       Capacities[MAX_CPUS];
   CHAR8        Types[MAX_CPUS][2];
   UINT32       Highest;
+  UINT32       Threshold;
+  UINT32       Next;
+  UINTN        Taken;
   BOOLEAN      Differ;
   UINT64       Gic[4];
   ADT_BUILDER  B;
@@ -673,8 +721,25 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
     if ((Index > 0) && (Capacities[Index] != Capacities[0])) { Differ = TRUE; }
     if (Capacities[Index] > Highest) { Highest = Capacities[Index]; }
   }
+  //
+  // The lowest capacity still "P": lower by one capacity at a time while the CPUs at it or above are half or fewer.
+  //
+  Threshold = Highest;
+  Taken = 0;
+  while (Differ) {
+    Taken = 0;
+    for (Index = 0; Index < Count; Index++) {
+      if (Capacities[Index] >= Threshold) { Taken++; }
+    }
+    if (Taken * 2 > Count) { break; }
+    Next = 0;
+    for (Index = 0; Index < Count; Index++) {
+      if ((Capacities[Index] < Threshold) && (Capacities[Index] > Next)) { Next = Capacities[Index]; }
+    }
+    Threshold = Next;
+  }
   for (Index = 0; Index < Count; Index++) {
-    Types[Index][0] = (Differ && (Capacities[Index] < Highest)) ? 'E' : 'P';
+    Types[Index][0] = (Differ && (Capacities[Index] < Threshold)) ? 'E' : 'P';
     Types[Index][1] = '\0';
   }
   if (EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "arm,gic-v3", &Node)) ||
