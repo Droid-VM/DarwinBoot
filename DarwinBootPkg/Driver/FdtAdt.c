@@ -38,15 +38,19 @@
 //                            windows (crosvm lays the redistributors out by the vCPU count) and /psci method from its conduit,
 //                            both in place. Each CPU's cluster-type from its capacity-dmips-mhz (crosvm --cpu-capacity, the host
 //                            core's capacity under the vCPU): "P" for the highest capacities, a whole capacity at a time, until
-//                            they are more than half the CPUs, "E" for the rest; "P" for all when they are equal or one has none
-//                            -- as make-droidvm-adt.py writes cpu0's, which must carry one (an AMP kernel panics on a CPU of no
-//                            cluster type). Only the highest was "P" before: an 8 Gen 3 VM had one performance core (its X4)
+//                            they are more than half the CPUs, but never the lowest capacity, "E" for the rest; "P" for all
+//                            when they are equal or one has none -- as make-droidvm-adt.py writes cpu0's, which must carry one
+//                            (an AMP kernel panics on a CPU of no cluster type). Only the highest was "P" at first: an 8 Gen 3
+//                            VM had one performance core (its X4)
 //                            and five A720s at 85-90% of it as efficiency cores, so the UI's threads crowded onto the one vCPU
 //                            (which the phone capped at 41% of its clock at times, below the A720s) while six sat mostly idle.
 //                            Every A720 "P" went the other way: the default and background work iPadOS keeps on efficiency
 //                            cores (the render server's Metal encoding among it) crowded onto the one vCPU left, on a little
 //                            core. Now an 8 Gen 3 on all its cores has its X4 and five A720s "P" and its A520s "E", on seven
-//                            (one A520 left out) the X4 and three A720s "P"; an 8 Elite or 8 Elite Gen 5 has every core "P".
+//                            (one A520 left out) the X4 and three A720s "P". The lowest capacity stays "E" whatever the count:
+//                            an 8 Elite Gen 5 VM on four of its performance cores and its two prime cores had all six "P" by
+//                            the count alone, and the iPadOS 27 kernel then stood still for 20 s as launchd started and launchd
+//                            died (2026-11-13); it has its prime cores "P" and the others "E", as before that rule.
 #include <Uefi.h>
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
@@ -796,6 +800,7 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   CHAR8        Types[MAX_CPUS][2];
   UINT32       Highest;
   UINT32       Threshold;
+  UINT32       Lowest;
   UINT32       Next;
   UINTN        Taken;
   BOOLEAN      Differ;
@@ -850,8 +855,13 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
     if (Capacities[Index] > Highest) { Highest = Capacities[Index]; }
   }
   //
-  // The lowest capacity still "P": lower by one capacity at a time while the CPUs at it or above are half or fewer.
+  // The lowest capacity still "P": lower by one capacity at a time while the CPUs at it or above are half or fewer, and never to
+  // the lowest capacity of all, whose CPUs stay "E".
   //
+  Lowest = Highest;
+  for (Index = 0; Index < Count; Index++) {
+    if (Capacities[Index] < Lowest) { Lowest = Capacities[Index]; }
+  }
   Threshold = Highest;
   Taken = 0;
   while (Differ) {
@@ -864,6 +874,7 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
     for (Index = 0; Index < Count; Index++) {
       if ((Capacities[Index] < Threshold) && (Capacities[Index] > Next)) { Next = Capacities[Index]; }
     }
+    if (Next <= Lowest) { break; }
     Threshold = Next;
   }
   for (Index = 0; Index < Count; Index++) {
