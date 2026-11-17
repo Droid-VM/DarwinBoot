@@ -70,6 +70,8 @@
 #define REDIST_STRIDE    0x20000   // GICv3 without VLPI: RD_base + SGI_base frames
 #define MAX_COMS         4         // crosvm's 16550 COM ports
 #define UART_PHANDLE     0x44560000 // "DV": the AAPL,phandle of uart0, com1..com4 the next ones (the tree's nodes carry none)
+#define GIC_MBI_PHANDLE  0x4d424946 // "MBIF": /arm-io/pcie's device-interrupt-parent, the AAPL,phandle its MSI controller takes
+#define MAX_PCI_RANGES   4
 
 //
 // EmbeddedPkg's FDT_CLIENT_PROTOCOL (Include/Protocol/FdtClient.h), member for member; Mu's basecore has no EmbeddedPkg.
@@ -568,12 +570,102 @@ FindPool (DB_FDT_CLIENT *Fdt, CONST CHAR8 *Name, UINT64 Pool[2])
   }
 }
 
+// crosvm's PCI host (pci-host-ecam-generic) as the virtual Mac's PCIe bridge, and its MBI frame as the bridge's MSI controller.
+//   /arm-io/pcie     pcie,vmapple1, the contract of Apple's AppleVirtualPlatformPCIE (Droid-VM/macOS-DroidVM
+//                    docs/k27-vmapple-pcie-msi-plan.md): reg the ECAM window, #address-cells 3, #size-cells 2, ranges in 28-byte
+//                    little-endian entries (flags word, PCI address, parent address relative to arm-io, size), device-interrupt-parent
+//                    the AAPL,phandle of its MSI controller's service, msi-frame-index that service's memory with the frame
+//   /arm-io/gic-mbi  droidvm,gic-mbi, reg the frame (the FDT intc's mbi-alias), mbi-ranges its first INTID and count: the nub of the
+//                    MSI controller (a kext of the guest, DroidVMGicMsi), which takes AAPL,phandle GIC_MBI_PHANDLE once it is ready
+// Only with an MBI frame (crosvm --mbi-spis): crosvm's INTx lines are not the bridge's "interrupt-base + n", so without MSI the PCI
+// devices would have no interrupt; the guest then runs on its virtio-mmio devices alone. A guest without a driver for either node
+// (iPadOS) leaves them alone. *End: the end of the highest PCI window, which arm-io's ranges have to reach.
+STATIC
+BOOLEAN
+AddPci (DB_FDT_CLIENT *Fdt, ADT_BUILDER *B, UINT64 Ecam[2], UINT32 Mbi[2], UINT64 *End)
+{
+  INT32       Node;
+  CONST UINT8 *Cells;
+  UINT32      Length;
+  UINT64      Frame;
+  UINT8       Ranges[28 * MAX_PCI_RANGES];
+  UINT32      Count;
+  UINT32      Index;
+  UINT32      Value;
+  UINT64      Pci;
+  UINT64      Cpu;
+  UINT64      Size;
+
+  *End = 0;
+  if (EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "arm,gic-v3", &Node)) ||
+      EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "mbi-alias", (CONST VOID **)&Cells, &Length)) || (Length != 8)) { return FALSE; }
+  Frame = Be64 (Cells);
+  if (EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "mbi-ranges", (CONST VOID **)&Cells, &Length)) || (Length != 8)) { return FALSE; }
+  Mbi[0] = Be32 (Cells);
+  Mbi[1] = Be32 (Cells + 4);
+  if ((Mbi[0] < 32) || (Mbi[1] == 0) || (Mbi[1] > 1020 - Mbi[0]) || (Frame < ARMIO_BASE) || (Frame > ARMIO_END - SIZE_4KB)) {
+    return FALSE;
+  }
+  if (EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "pci-host-ecam-generic", &Node)) || !FdtReg (Fdt, Node, &Ecam[0], &Ecam[1]) ||
+      (Ecam[1] == 0) || (Ecam[0] < ARMIO_BASE) || (Ecam[0] > ARMIO_END - Ecam[1])) { return FALSE; }
+  // FDT ranges: the child's three cells (flags, 64-bit PCI address), the root's two (the CPU address), two of size, big-endian
+  if (EFI_ERROR (Fdt->GetNodeProperty (Fdt, Node, "ranges", (CONST VOID **)&Cells, &Length)) || (Length == 0) ||
+      (Length % 28 != 0) || (Length / 28 > MAX_PCI_RANGES)) { return FALSE; }
+  Count = Length / 28;
+  for (Index = 0; Index < Count; Index++) {
+    Value = Be32 (Cells + 28 * Index);
+    Pci = Be64 (Cells + 28 * Index + 4);
+    Cpu = Be64 (Cells + 28 * Index + 12);
+    Size = Be64 (Cells + 28 * Index + 20);
+    if ((Size == 0) || (Cpu < ARMIO_BASE) || (Cpu > MAX_UINT64 - Size)) { return FALSE; }
+    WriteUnaligned32 ((UINT32 *)(Ranges + 28 * Index), Value);
+    WriteUnaligned64 ((UINT64 *)(Ranges + 28 * Index + 4), Pci);
+    WriteUnaligned64 ((UINT64 *)(Ranges + 28 * Index + 12), Cpu - ARMIO_BASE);
+    WriteUnaligned64 ((UINT64 *)(Ranges + 28 * Index + 20), Size);
+    if (Cpu + Size > *End) { *End = Cpu + Size; }
+  }
+  AddWindow (B, "gic-mbi", "droidvm,gic-mbi", Frame, SIZE_4KB, FALSE, NULL, NULL);
+  AddProperty (B, "mbi-ranges", Mbi, 2 * sizeof (UINT32));
+  AddWindow (B, "pcie", "pcie,vmapple1", Ecam[0], Ecam[1], TRUE, NULL, NULL);
+  AddString (B, "device_type", "pci");
+  Value = 3;
+  AddProperty (B, "#address-cells", &Value, sizeof (Value));
+  Value = 2;
+  AddProperty (B, "#size-cells", &Value, sizeof (Value));
+  AddProperty (B, "ranges", Ranges, 28 * Count);
+  Value = GIC_MBI_PHANDLE;
+  AddProperty (B, "device-interrupt-parent", &Value, sizeof (Value));
+  Value = 0;
+  AddProperty (B, "msi-frame-index", &Value, sizeof (Value));
+  return TRUE;
+}
+
+// arm-io's ranges (its children's addresses from 0 at ARMIO_BASE, to ARMIO_END) made to reach End, so IODTResolveAddressing
+// resolves the PCI devices' BARs in crosvm's 64-bit window, above 1 GiB, through /arm-io/pcie's ranges and then arm-io's.
+STATIC
+BOOLEAN
+WidenArmIo (UINT8 *Data, UINTN Size, UINT64 End)
+{
+  UINTN  ArmIo;
+  UINTN  At;
+  UINT32 Length;
+  UINT64 Range[3];
+
+  if (!AdtChild (Data, Size, 0, "arm-io", &ArmIo) || !AdtProperty (Data, Size, ArmIo, "ranges", &At, &Length) ||
+      (Length != sizeof (Range))) { return FALSE; }
+  CopyMem (Range, Data + At, sizeof (Range));
+  if ((Range[0] != 0) || (Range[1] != ARMIO_BASE)) { return FALSE; }
+  if (Range[2] >= End - ARMIO_BASE) { return TRUE; }
+  Range[2] = End - ARMIO_BASE;
+  return AdtSet (Data, Size, ArmIo, "ranges", Range, sizeof (Range));
+}
+
 STATIC
 EFI_STATUS
 FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
 {
   STATIC CONST CHAR8  *Taken[] = { "data-store", "net", "virtio-gpu", "virtio-snd", "battery", "cpufreq", "input-0", "virtio-mmio-0", "virtio-media-0",
-                                   "virtio-console-0", "uart0", "com1" };
+                                   "virtio-console-0", "uart0", "com1", "pcie", "gic-mbi" };
   WINDOW       Windows[MAX_WINDOWS];
   ADT_BUILDER  B;
   UINT8        *Data;
@@ -599,6 +691,10 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
   UINT64       Stdout;
   UINT32       Phandle;
   UINT32       Console;
+  BOOLEAN      Pci;
+  UINT64       Ecam[2];
+  UINT32       Mbi[2];
+  UINT64       PciEnd;
   UINTN        Defaults;
   INT32        Node;
   CHAR8        Name[32];
@@ -712,9 +808,13 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
     if ((Stdout != 0) && (Stdout == Coms[Index][0])) { Console = Phandle; }
   }
   if ((Pl011[1] != 0) && (Stdout != 0) && (Stdout == Pl011[0])) { Console = UART_PHANDLE; }
+  Pci = AddPci (Fdt, &B, Ecam, Mbi, &PciEnd);
   Status = AdtAppend (Tree, TreeSize, ArmIo, &B);
   FreePool (B.Data);
   if (EFI_ERROR (Status)) { return Status; }
+  if (Pci && !WidenArmIo (*Tree, *TreeSize, PciEnd)) {
+    Print (L"DARWINBOOT: /arm-io ranges are not [0 -> 0x%lx]: the PCI devices' BARs above it will not resolve\n", ARMIO_BASE);
+  }
   if ((Console != 0) && AdtChild (*Tree, *TreeSize, 0, "defaults", &Defaults)) {
     if (AdtProperty (*Tree, *TreeSize, Defaults, "droidvm,serial-device", &End, &Phandle)) {
       Console = 0;   // the tree names its own
@@ -727,6 +827,12 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
          (UINT32)Disks, Store ? " + data store" : "", (UINT32)Inputs, Net ? "net, " : "", Gpu ? "gpu, " : "",
          Sound ? "snd, " : "", (UINT32)Media, (UINT32)Consoles, DrmPool[0], DrmPool[1], MediaPool[0], MediaPool[1],
          Battery[1] ? ", battery" : "", Cpufreq[1] ? ", cpufreq" : "");
+  if (Pci) {
+    Print (L"DARWINBOOT: FDT PCI: ECAM 0x%lx+0x%lx, windows to 0x%lx, MSI on MBI INTID %u..%u\n", Ecam[0], Ecam[1], PciEnd, Mbi[0],
+           Mbi[0] + Mbi[1] - 1);
+  } else {
+    Print (L"DARWINBOOT: FDT PCI: none (no PCI host or no MBI frame): virtio-mmio devices only\n");
+  }
   if (Console == 0) {
     Print (L"DARWINBOOT: FDT serial: %a%u COM port(s), no console\n", (Pl011[1] != 0) ? "SBSA UART, " : "", (UINT32)ComCount);
   } else if (Console == UART_PHANDLE) {
