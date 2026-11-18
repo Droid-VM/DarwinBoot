@@ -580,9 +580,12 @@ FindPool (DB_FDT_CLIENT *Fdt, CONST CHAR8 *Name, UINT64 Pool[2])
 // Only with an MBI frame (crosvm --mbi-spis): crosvm's INTx lines are not the bridge's "interrupt-base + n", so without MSI the PCI
 // devices would have no interrupt; the guest then runs on its virtio-mmio devices alone. A guest without a driver for either node
 // (iPadOS) leaves them alone. *End: the end of the highest PCI window, which arm-io's ranges have to reach.
+// /arm-io/pcie also carries the pools a virtio-mmio GPU or media window carries, drm-host-pool and media-host-pool (the FDT's
+// droidvm,pool nodes, when there are any): a virtio-pci GPU or media device has no node of its own, and its driver takes them here.
 STATIC
 BOOLEAN
-AddPci (DB_FDT_CLIENT *Fdt, ADT_BUILDER *B, UINT64 Ecam[2], UINT32 Mbi[2], UINT64 *End)
+AddPci (DB_FDT_CLIENT *Fdt, ADT_BUILDER *B, UINT64 Ecam[2], UINT32 Mbi[2], UINT64 *End, CONST UINT64 DrmPool[2],
+        CONST UINT64 MediaPool[2])
 {
   INT32       Node;
   CONST UINT8 *Cells;
@@ -637,6 +640,8 @@ AddPci (DB_FDT_CLIENT *Fdt, ADT_BUILDER *B, UINT64 Ecam[2], UINT32 Mbi[2], UINT6
   AddProperty (B, "device-interrupt-parent", &Value, sizeof (Value));
   Value = 0;
   AddProperty (B, "msi-frame-index", &Value, sizeof (Value));
+  if (DrmPool[1] != 0) { AddPair (B, "drm-host-pool", DrmPool[0], DrmPool[1]); }
+  if (MediaPool[1] != 0) { AddPair (B, "media-host-pool", MediaPool[0], MediaPool[1]); }
   return TRUE;
 }
 
@@ -808,7 +813,7 @@ FillDevices (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
     if ((Stdout != 0) && (Stdout == Coms[Index][0])) { Console = Phandle; }
   }
   if ((Pl011[1] != 0) && (Stdout != 0) && (Stdout == Pl011[0])) { Console = UART_PHANDLE; }
-  Pci = AddPci (Fdt, &B, Ecam, Mbi, &PciEnd);
+  Pci = AddPci (Fdt, &B, Ecam, Mbi, &PciEnd, DrmPool, MediaPool);
   Status = AdtAppend (Tree, TreeSize, ArmIo, &B);
   FreePool (B.Data);
   if (EFI_ERROR (Status)) { return Status; }
