@@ -38,9 +38,10 @@
 //                            windows (crosvm lays the redistributors out by the vCPU count) and /psci method from its conduit,
 //                            both in place. Each CPU's cluster-type from its capacity-dmips-mhz (crosvm --cpu-capacity, the host
 //                            core's capacity under the vCPU): "P" for the highest capacities, a whole capacity at a time, until
-//                            they are more than half the CPUs, but never the lowest capacity, "E" for the rest; "P" for all
-//                            when they are equal or one has none -- as make-droidvm-adt.py writes cpu0's, which must carry one
-//                            (an AMP kernel panics on a CPU of no cluster type). Only the highest was "P" at first: an 8 Gen 3
+//                            they are more than half the CPUs, but never the lowest capacity, "E" for the rest; when they are
+//                            equal or one has none (vCPUs that float: the app's default), the first half "E" and the rest "P"
+//                            -- cpu0's written in place, as make-droidvm-adt.py writes one (an AMP kernel panics on a CPU of
+//                            no cluster type). Only the highest was "P" at first: an 8 Gen 3
 //                            VM had one performance core (its X4)
 //                            and five A720s at 85-90% of it as efficiency cores, so the UI's threads crowded onto the one vCPU
 //                            (which the phone capped at 41% of its clock at times, below the A720s) while six sat mostly idle.
@@ -988,8 +989,13 @@ FillCpus (DB_FDT_CLIENT *Fdt, VOID **Tree, UINTN *TreeSize)
     if (Next <= Lowest) { break; }
     Threshold = Next;
   }
+  //
+  // Equal capacities, or none (a VM whose vCPUs float, crosvm passed no --cpu-capacity): nothing says which vCPU is faster, and
+  // every one "P" stalls the iPadOS 27 kernel as launchd starts (see the top). The first half "E", the rest "P", as an Apple
+  // SoC's cluster order (a lone CPU stays "P").
+  //
   for (Index = 0; Index < Count; Index++) {
-    Types[Index][0] = (Differ && (Capacities[Index] < Threshold)) ? 'E' : 'P';
+    Types[Index][0] = (Differ ? (Capacities[Index] < Threshold) : (Index < Count / 2)) ? 'E' : 'P';
     Types[Index][1] = '\0';
   }
   if (EFI_ERROR (Fdt->FindCompatibleNode (Fdt, "arm,gic-v3", &Node)) ||
